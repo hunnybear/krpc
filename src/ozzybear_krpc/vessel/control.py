@@ -63,18 +63,17 @@ def launch_rocket(conn, vessel, heading, turn_altitude=10000):
 
 def _stage_ready(resources_obj, autostage_resources, mode=const.AND):
     if mode not in [const.AND, const.OR]:
-        raise ValueError('mode must be one of [{0}], {1} was provided'.format(', '.join([const.AND, const.OR]), mode))
-    maxes = dict((res, resources_obj.max(res))for res in autostage_resources)
+        valid_modes = ', '.join([const.AND, const.OR])
+        msg = 'mode must be one of [{0}], {1} was provided'.format(valid_modes, mode)
+        raise ValueError(msg)
 
     for resource in autostage_resources:
         current = resources_obj.amount(resource)
-        if current <= 0 or current / maxes[resource] <= 0.05:
+        if current <= 0:
             # TODO logging
-            print('out of {0}'.format(resource))
             if mode == const.OR:
                 return True
         elif mode == const.AND:
-            print("in mode AND and found still have resource {0}".format(resource))
             return False
 
     if mode == const.AND:
@@ -85,7 +84,7 @@ def _stage_ready(resources_obj, autostage_resources, mode=const.AND):
         return False
 
 
-def _get_autostage_stages(vessel, autostage_resources=const.RESOURCES_FUEL, stop_if_skipping=True):
+def _get_autostage_stages(vessel, autostage_resources=const.RESOURCES_FUEL, skip_non_engine=True):
     # I /think/ this needs the +1, as the dox say it corresponds to the
     # in-game UI, but I haven't checked yet
     count_stages = get_current_stage(vessel)
@@ -99,52 +98,116 @@ def _get_autostage_stages(vessel, autostage_resources=const.RESOURCES_FUEL, stop
         print(stage_i, set(stage_resources.names), autostage_resources)
         if set(stage_resources.names).intersection(autostage_resources):
             stages.append(stage_i)
-        elif stop_if_skipping:
+        elif not skip_non_engine:
             stages.append(None)
     # TODO logging
     print('stages: {0}'.format(', '.join([str(i) for i in stages])))
     return stages
 
 
+class InterruptHandler(object):
 
-def get_gravity_turn_interrupt(conn, def_altitude=10000):
-    def gravity_turn_interrupt(vessel, altitude=def_altitude):
-        # TODO
-        pass
+    def __init__(self, conn, vessel):
+        self._vessel = vessel
+        self._sm = ozzybear_krpc.telemetry.StreamManager(conn)
+
+        super(InterruptHandler, self).__init__()
+
+    def __call__(self, vessel):
+        assert vessel._object_id == self._vessel
+        self._handle()
+
+
+class DeployChuteInterrupt(InterruptHandler):
+
+    def __init__(self, conn, vessel):
+        super(Deploy_Chute_Interrupt, self).__init__(conn, vessel)
+
+        self._parachutes_stream = conn.add_stream(getattr, vessel.parts, 'parachutes')
+        self._pressure_stream = self._sm.get_pressure_stream(vessel)
+        self._vert_speed_stream = self._sm.get_vertical_speed_stream(vessel)
+
+    def _handle(self):
+
+        if self._vert_speed_stream() >= 0:
+            return False
+
+        parachutes = self._parachutes_stream()
+        if not parachutes:
+            print(parachutes)
+            print("removing parachute interrupt")
+            raise InterruptResponse(stop=True, remove=True)
+        pressure = self._pressure_stream()
+        pressure_atm = ozzybear_krpc.telemetry.convert_pascal_to_atmosphere(pressure)
+
+        for parachute in parachutes:
+            if pressure_atm >= parachute.deploy_min_pressure:
+                parachute.deploy()
+
+
+class GravityTurnInterrupt(InterruptHandler):
+    def __init__(self, conn, vessel, hdg, turn_start=250, turn_end=12000):
+
+        self._heading = hdg
+        if turn_start >= turn_end:
+            raise ValueError('turn_start must be smaller than turn_end')
+
+        self.turn_start = turn_start
+        self.turn_end = turn_end
+
+        super(GravityTurnInterrupt, self).__init__(conn, vessel)
+
+        self._vert_speed_stream = self._sm.get_vertical_speed_stream(vessel)
+        self._target_pitch_stream = self._sm.get_target_pitch_stream(vessel)
+        self._mean_altitude_stream = self._sm.get_mean_altitude_stream(vessel)
+
+    def _handle(self):
+
+        turn_height = self.turn_end - self.turn_start
+
+        if self._vert_speed_stream() <= 0:
+            return False
+        mean_altitude = self._mean_altitude_stream()
+        if self.turn_start <= mean_altitude <= self.turn_end:
+            progress = (mean_altitude - self.turn_start) / turn_height
+            new_pitch_angle = progress * 90
+            if abs(new_pitch_angle - self._target_pitch_stream()) < 1:
+                print('setting pitch to {0}, heading to {1}'.format(new_pitch_angle, self.heading))
+                self._vessel.auto_pilot.target_pitch_and_heading(pitch=new_pitch_angle, heading=self.heading)
+
+        elif mean_altitude > self.turn_end:
+            raise InterruptResponse(remove=True)
 
 
 def autostage(
         vessel, stages=None,
-        stop_if_skipping=True,
+        skip_non_engine=False,
+        stop_non_engine=True,
         interrupts=None, noisy=True,
         autostage_resources=const.RESOURCES_FUEL):
 
     if stages is None:
-        stages = _get_autostage_stages(vessel, autostage_resources=autostage_resources, stop_if_skipping=stop_if_skipping)
+        stages = _get_autostage_stages(vessel, autostage_resources=autostage_resources, skip_non_engine=skip_non_engine)
 
-    interrupts = set(interrupts or [])
+    interrupts = list(interrupts or [])
 
     for stage in stages:
-        if stage is None:
+        if stage is None and stop_non_engine:
             raise NonEngineStage()
         while True:
-            resources = vessel.resources_in_decouple_stage(stage)
-            if _stage_ready(resources, autostage_resources  , mode=const.AND):
-                print("firing stage {0}".format(stage))
-                time.sleep(0.5)
-                vessel.control.activate_next_stage()
-                print("stage {0} fired.".format(stage))
-                break
-            if noisy:
-                for resource in autostage_resources:
-                    pass
-                    #if resources.amount(resource):
-                        #print("{0} level: {1}".format(resource, resources.amount(resource)))
+            if stage is not None:
+                resources = vessel.resources_in_decouple_stage(stage)
+                if _stage_ready(resources, autostage_resources, mode=const.AND):
+                    print("firing stage {0}".format(stage))
+                    time.sleep(0.5)
+                    vessel.control.activate_next_stage()
+                    print("stage {0} fired.".format(stage))
+                    break
             if interrupts is not None:
                 for interrupt in set(interrupts):
                     try:
                         interrupt(vessel)
-                    except Interrupt as exc:
+                    except InterruptResponse as exc:
                         if exc.remove:
                             interrupts.remove(interrupt)
                         if exc.stop:
@@ -160,7 +223,7 @@ class NonEngineStage(Exception):
     pass
 
 
-class Interrupt(Exception):
+class InterruptResponse(Exception):
     def __init__(self, msg=None, remove=False, skip_stage=False, stop=False):
         self.remove = remove
         self.skip_stage = skip_stage
@@ -169,7 +232,7 @@ class Interrupt(Exception):
         if msg is None:
             msg = 'Interrupt'
 
-        super(Interrupt, self).__init__(msg)
+        super(InterruptResponse, self).__init__(msg)
 
 
 

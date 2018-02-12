@@ -8,5 +8,6 @@ AND = 'and'
 OR = 'or'
 
 MEAN_ALTITUDE = 'mean_altitude'
+SURFACE_ALTITUDE = 'surface_altitude'
 APOAPSIS_ALTITUDE = 'apoapsis_altitude'
 PERIAPSIS_ALTITUDE = 'periapsis_altitude'
