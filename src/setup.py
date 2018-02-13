@@ -20,7 +20,8 @@ setuptools.setup(
     entry_points = {
         'console_scripts': [
             'hello_world=ozzybear_krpc.cli.cli_experiments:hello_world',
-            'launch_test=ozzybear_krpc.cli.cli_experiments:launch_tests'
+            'launch_test=ozzybear_krpc.cli.cli_experiments:launch_tests',
+            'orbit_test=ozzybear_krpc.cli.cli_experiments.orbit_test'
         ],
     }
 )
