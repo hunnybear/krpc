@@ -47,7 +47,7 @@ class StreamManager(metaclass=ManagerMeta):
     @staticmethod
     def _get_dict_key_val(item):
         if hasattr(item, '_object_id'):
-            return{"{0}::{1}".format(str(item.__class__), item._object_id)}
+            return "{0}::{1}".format(str(item.__class__), item._object_id)
 
         return str(item)
 
@@ -59,10 +59,11 @@ class StreamManager(metaclass=ManagerMeta):
             key_args = tuple(cls._get_dict_key_val(item) for item in args)
             key_kwargs = tuple('{0}=>{1}'.format(k, cls._get_dict_key_val(v)) for k, v in kwargs.items())
             stream_key = key_args + key_kwargs
+            print(stream_key)
             if stream_key not in self._streams.setdefault(function.__name__, {}):
                 stream = function(self._conn, *args, **kwargs)
-                self._streams[function.__name__][key] = stream
-            return self._streams[function.__name__][key]
+                self._streams[function.__name__][stream_key] = stream
+            return self._streams[function.__name__][stream_key]
 
         setattr(cls, function.__name__, method)
 
@@ -126,6 +127,10 @@ def get_mean_altitude_stream(conn, vessel):
 
 @StreamManager.add_managed_method
 def get_stage_resource_stream(conn, vessel, stage, resource, cumulative=False):
+    """
+    Get a stream of the amount of a given resource in a stage.
+    """
+
     resource_obj = vessel.resources_in_decouple_stage(stage=stage, cumulative=cumulative)
     return conn.add_stream(resource_obj.amount, resource)
 
