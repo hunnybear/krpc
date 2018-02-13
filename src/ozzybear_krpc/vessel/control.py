@@ -106,36 +106,47 @@ def _get_autostage_stages(vessel, autostage_resources=const.RESOURCES_FUEL, skip
 
 
 class InterruptHandler(object):
-
+    CONTROL_HANDLER = False
     def __init__(self, conn, vessel):
         self._vessel = vessel
         self._sm = ozzybear_krpc.telemetry.StreamManager(conn)
+        self.finished = False
+        self._prerequisites = set()
 
         super(InterruptHandler, self).__init__()
 
+    def add_prerequisite(self, prerequisite):
+        self._prerequisites.add(prerequisite)
+
+    def can_handle(self):
+        if self._prerequisites:
+            if not all(prereq() for prereq in self._prerequisites):
+                return False
+
+        return True
+
     def __call__(self, vessel):
-        assert vessel._object_id == self._vessel
+        assert vessel._object_id == self._vessel._object_id
         self._handle()
 
 
 class DeployChuteInterrupt(InterruptHandler):
 
     def __init__(self, conn, vessel):
-        super(Deploy_Chute_Interrupt, self).__init__(conn, vessel)
+        super(DeployChuteInterrupt, self).__init__(conn, vessel)
 
         self._parachutes_stream = conn.add_stream(getattr, vessel.parts, 'parachutes')
         self._pressure_stream = self._sm.get_pressure_stream(vessel)
         self._vert_speed_stream = self._sm.get_vertical_speed_stream(vessel)
 
     def _handle(self):
-
-        if self._vert_speed_stream() >= 0:
+        # TODO figure out a good value here
+        if self._vert_speed_stream() >= -30:
             return False
 
         parachutes = self._parachutes_stream()
         if not parachutes:
-            print(parachutes)
-            print("removing parachute interrupt")
+            self.finished = True
             raise InterruptResponse(stop=True, remove=True)
         pressure = self._pressure_stream()
         pressure_atm = ozzybear_krpc.telemetry.convert_pascal_to_atmosphere(pressure)
@@ -145,37 +156,61 @@ class DeployChuteInterrupt(InterruptHandler):
                 parachute.deploy()
 
 
-class GravityTurnInterrupt(InterruptHandler):
-    def __init__(self, conn, vessel, hdg, turn_start=250, turn_end=12000):
+class TargetApoapsisInterrupt(InterruptHandler):
+    def __init__(self, conn, vessel, target_altitude):
+        super(TargetApoapsisInterrupt, self).__init__(conn, vessel)
+        self.target_altitude = target_altitude
 
-        self._heading = hdg
+
+    def _handle(self, vessel):
+        # TODO
+        pass
+
+
+class GravityTurnInterrupt(InterruptHandler):
+    CONTROL_HANDLER = True
+    def __init__(self, conn, vessel, heading, starting_pitch=90, target_pitch=45, turn_start=250, turn_end=12000):
+
+        super(GravityTurnInterrupt, self).__init__(conn, vessel)
+        self._heading = heading
         if turn_start >= turn_end:
             raise ValueError('turn_start must be smaller than turn_end')
 
         self.turn_start = turn_start
         self.turn_end = turn_end
+        self.starting_pitch = starting_pitch
+        self.last_pitch = starting_pitch
+        self.target_pitch = target_pitch
 
-        super(GravityTurnInterrupt, self).__init__(conn, vessel)
+        # TODO maybe check where 1) the current target is and 2) the current
+        # actual pitch is.
+        self._vessel.auto_pilot.target_pitch_and_heading(starting_pitch, heading)
 
         self._vert_speed_stream = self._sm.get_vertical_speed_stream(vessel)
-        self._target_pitch_stream = self._sm.get_target_pitch_stream(vessel)
         self._mean_altitude_stream = self._sm.get_mean_altitude_stream(vessel)
 
-    def _handle(self):
-
+    def _get_target_pitch(self, mean_altitude):
         turn_height = self.turn_end - self.turn_start
+        progress = float(mean_altitude - self.turn_start) / turn_height
+
+        new_target = self.target_pitch - self.starting_pitch * progress
+        return new_target
+
+    def _handle(self):
 
         if self._vert_speed_stream() <= 0:
             return False
         mean_altitude = self._mean_altitude_stream()
         if self.turn_start <= mean_altitude <= self.turn_end:
-            progress = (mean_altitude - self.turn_start) / turn_height
-            new_pitch_angle = progress * 90
-            if abs(new_pitch_angle - self._target_pitch_stream()) < 1:
-                print('setting pitch to {0}, heading to {1}'.format(new_pitch_angle, self.heading))
-                self._vessel.auto_pilot.target_pitch_and_heading(pitch=new_pitch_angle, heading=self.heading)
+            new_target_pitch = self._get_target_pitch(mean_altitude)
 
+            print('new pitch angle: {0}'.format(new_target_pitch))
+            if abs(new_target_pitch - self.last_pitch) > 1:
+                print('setting pitch to {0}, heading to {1}'.format(new_target_pitch, self._heading))
+                self._vessel.auto_pilot.target_pitch_and_heading(new_target_pitch, self._heading)
+                self.last_pitch = new_target_pitch
         elif mean_altitude > self.turn_end:
+            self.finished = True
             raise InterruptResponse(remove=True)
 
 
@@ -184,12 +219,15 @@ def autostage(
         skip_non_engine=False,
         stop_non_engine=True,
         interrupts=None, noisy=True,
-        autostage_resources=const.RESOURCES_FUEL):
+        autostage_resources=const.RESOURCES_FUEL,
+        allow_multiple_control_handlers=False):
 
     if stages is None:
         stages = _get_autostage_stages(vessel, autostage_resources=autostage_resources, skip_non_engine=skip_non_engine)
 
     interrupts = list(interrupts or [])
+
+    vessel.auto_pilot.target_roll = 0
 
     for stage in stages:
         if stage is None and stop_non_engine:
@@ -204,9 +242,20 @@ def autostage(
                     print("stage {0} fired.".format(stage))
                     break
             if interrupts is not None:
+                control_handler_handled = False
                 for interrupt in set(interrupts):
+                    if (control_handler_handled and
+                            interrupt.CONTROL_HANDLER and
+                            not allow_multiple_control_handlers):
+                        # this is mostly a sanity check, this case should
+                        # probably really be handled by prerequisites.
+                        # Maybe stick in some assertions or print debugging
+                        # here if I come into issues.
+                        continue
+                    if not handler.can_handle():
+                        continue
                     try:
-                        interrupt(vessel)
+                        handled = interrupt(vessel)
                     except InterruptResponse as exc:
                         if exc.remove:
                             interrupts.remove(interrupt)
@@ -214,6 +263,9 @@ def autostage(
                             raise exc
                         if exc.skip_stage:
                             break
+                    else:
+                        if handled:
+
             time.sleep(0.1)
 
     print('no more stages!')
