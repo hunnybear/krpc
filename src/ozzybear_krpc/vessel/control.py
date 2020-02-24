@@ -156,15 +156,34 @@ class DeployChuteInterrupt(InterruptHandler):
                 parachute.deploy()
 
 
-class TargetApoapsisInterrupt(InterruptHandler):
+class TargetPeriapsisInterrupt(InterruptHandler):
     def __init__(self, conn, vessel, target_altitude):
         super(TargetApoapsisInterrupt, self).__init__(conn, vessel)
         self.target_altitude = target_altitude
 
+        self._periapsis_alt_stream = self._sm.get_periapsis_altitude_stream(vessel)
 
     def _handle(self, vessel):
-        # TODO
-        pass
+        # TODO predictively check whether we're close
+        periapsis_alt = self._periapsis_alt_stream()
+        if periapsis_alt >= self.target_altitude:
+            self.finished = True
+            raise InterruptResponse(remove=True)
+
+        # TODO scale down throttle when nearing target periapsis
+
+
+class AscentStageInterrupt(InterruptHandler):
+    def __init__(self, conn, vessel, stages=None, pre_sep=None):
+        super(AscentStageInterrupt, self).__init__(conn, vessel)
+        if stages is None:
+            stages = _get_autostage_stages(vessel)
+
+        self.pre_sep = pre_sep
+
+
+    def _handle(self):
+        active_stage = get_current_stage(vessel)
 
 
 class GravityTurnInterrupt(InterruptHandler):
@@ -192,8 +211,8 @@ class GravityTurnInterrupt(InterruptHandler):
     def _get_target_pitch(self, mean_altitude):
         turn_height = self.turn_end - self.turn_start
         progress = float(mean_altitude - self.turn_start) / turn_height
-
-        new_target = self.target_pitch - self.starting_pitch * progress
+        print(mean_altitude, self.turn_start, turn_height, progress)
+        new_target = ((self.target_pitch - self.starting_pitch) * progress) + self.starting_pitch
         return new_target
 
     def _handle(self):
@@ -204,9 +223,9 @@ class GravityTurnInterrupt(InterruptHandler):
         if self.turn_start <= mean_altitude <= self.turn_end:
             new_target_pitch = self._get_target_pitch(mean_altitude)
 
-            print('new pitch angle: {0}'.format(new_target_pitch))
+            #print('new pitch angle: {0}'.format(new_target_pitch))
             if abs(new_target_pitch - self.last_pitch) > 1:
-                print('setting pitch to {0}, heading to {1}'.format(new_target_pitch, self._heading))
+                #print('setting pitch to {0}, heading to {1}'.format(new_target_pitch, self._heading))
                 self._vessel.auto_pilot.target_pitch_and_heading(new_target_pitch, self._heading)
                 self.last_pitch = new_target_pitch
         elif mean_altitude > self.turn_end:
@@ -243,9 +262,9 @@ def autostage(
                     break
             if interrupts is not None:
                 control_handler_handled = False
-                for interrupt in set(interrupts):
+                for handler in set(interrupts):
                     if (control_handler_handled and
-                            interrupt.CONTROL_HANDLER and
+                            handler.CONTROL_HANDLER and
                             not allow_multiple_control_handlers):
                         # this is mostly a sanity check, this case should
                         # probably really be handled by prerequisites.
@@ -255,16 +274,18 @@ def autostage(
                     if not handler.can_handle():
                         continue
                     try:
-                        handled = interrupt(vessel)
+                        handled = handler(vessel)
                     except InterruptResponse as exc:
                         if exc.remove:
-                            interrupts.remove(interrupt)
+                            interrupts.remove(handler)
                         if exc.stop:
                             raise exc
                         if exc.skip_stage:
                             break
                     else:
                         if handled:
+                            # TODO, forget what I was doing here
+                            pass
 
             time.sleep(0.1)
 

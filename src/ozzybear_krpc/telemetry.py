@@ -105,6 +105,21 @@ def get_apoapsis_altitude_stream(conn, vessel):
 
 
 @StreamManager.add_managed_method
+def get_periapsis_altitde_stream(conn, vessel):
+    return conn.add_stream(getattr, vessel.orbit, const.PERIAPSIS_ALTITUDE)
+
+
+@StreamManager.add_managed_method
+def get_time_to_apoapsis_stream(conn, vessel):
+    return conn.add_stream(getattr, vessel.orbit, const.TIME_TO_APOAPSIS)
+
+
+@StreamManager.add_managed_method
+def get_time_to_periapsis_stream(conn, vessel):
+    return conn.add_stream(getattr, vessel.orbit, const.TIME_TO_PERIAPSIS)
+
+
+@StreamManager.add_managed_method
 def get_landspeed(conn, vessel):
     ref_frame = conn.space_center.ReferenceFrame.create_hybrid(
         position=vessel.orbit.body.reference_frame,
