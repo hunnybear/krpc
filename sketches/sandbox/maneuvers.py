@@ -1,15 +1,21 @@
 import math
 
-from sketches.sandbox import utils
+import sandbox.utils as utils
 
 
 def changePeriapsis(vessel, ut, targetAltitude):
     mu = vessel.orbit.body.gravitational_parameter
-    r = vessel.orbit.body.equatorial_radius + targetAltitude
+
+    # where we're starting
+    r1 = vessel.orbit.apoapsis
     a1 = vessel.orbit.semi_major_axis
-    a2 = r
-    v1 = math.sqrt(mu*((2./r)-(1./a1)))
-    v2 = math.sqrt(mu*((2./r)-(1./a2)))
+    v1 = math.sqrt(mu*((2./r1)-(1./a1)))
+
+    # where we're going
+    r2 = r1
+    a2 = (r1 + targetAltitude + vessel.orbit.body.equatorial_radius) / 2 # why?
+    v2 = math.sqrt(mu*((2./r2)-(1./a2)))
+
     deltaV = v2 - v1
 
     node = vessel.control.add_node(ut + vessel.orbit.time_to_apoapsis, prograde=deltaV)
@@ -18,11 +24,17 @@ def changePeriapsis(vessel, ut, targetAltitude):
 
 def changeApoapsis(vessel, ut, targetAltitude):
     mu = vessel.orbit.body.gravitational_parameter
-    r = vessel.orbit.body.equatorial_radius + targetAltitude
+
+    # where we're starting
+    r1 = vessel.orbit.periapsis
     a1 = vessel.orbit.semi_major_axis
-    a2 = r
-    v1 = math.sqrt(mu*((2./r)-(1./a1)))
-    v2 = math.sqrt(mu*((2./r)-(1./a2)))
+    v1 = math.sqrt(mu * ((2. / r1) - (1. / a1)))
+
+    # where we're going
+    r2 = r1
+    a2 = (r1 + targetAltitude + vessel.orbit.body.equatorial_radius) / 2
+    v2 = math.sqrt(mu * ((2. / r2) - (1. / a2)))
+
     deltaV = v2 - v1
 
     node = vessel.control.add_node(ut + vessel.orbit.time_to_periapsis, prograde=deltaV)
@@ -42,17 +54,22 @@ def calculateBurnTime(vessel, node):
 
 
 def smoothThrottle(vessel, deltaV, t):
-    ISP = vessel.specific_impulse * utils.gHere()
+    ISP = vessel.specific_impulse * utils.gHere(vessel.orbit.body, vessel)
     m0 = vessel.mass
     m1 = m0 / math.exp(deltaV/ISP)
     F = ((m0 - m1) / t) * ISP
     return F / vessel.available_thrust
 
 
-class ExecuteManeuver(object):
-    def __init__(self, conn, vessel, node, tuneTime=2, leadTime=5):
+class ExecuteManeuver(utils.Program):
+    def __init__(self, conn, vessel, node=None, tuneTime=2, leadTime=60):
+        super(ExecuteManeuver, self).__init__('Maneuver')
         self.conn = conn
         self.vessel = vessel
+
+        if not node:
+            node = vessel.control.nodes[0]
+
         self.node = node
         self.leadTime = leadTime
         self.remainingBurn = conn.add_stream(node.remaining_burn_vector, node.reference_frame)
@@ -68,15 +85,17 @@ class ExecuteManeuver(object):
         self.ap.target_roll = float("nan")
         self.ap.engage()
 
+        self.mode = ''
+
     def __call__(self):
         if not self.node:
+            self.messages.append('Node deleted')
             return True
-
-        self.ap.wait()
 
         burnUT = self.nodeUT - (self.totalBurnTime / 2.)
 
         if self.ut() - burnUT - self.leadTime:
+            self.mode = 'Warping'
             self.conn.space_center.warp_to(burnUT - self.leadTime)
 
         if self.ut() < burnUT:
@@ -84,13 +103,25 @@ class ExecuteManeuver(object):
 
         self.remainingBurnTime = calculateBurnTime(self.vessel, self.node)
 
-        if self.remainingBurnTime > self.tuneTime:
-            self.vessel.control.throttle = 1
-            return False
-        elif self.remainingBurn()[1] > 0:
-            self.vessel.control.throttle = max(0.005, smoothThrottle(self.vessel, self.remainingBurn()[1], self.tuneTime))
-            return False
-        else:
+        if self.remainingBurn()[1] <= 1.0 or utils.hasAborted(self.vessel):
+            self.mode = 'Done'
             self.vessel.control.throttle = 0.0
+            self.node.remove()
             self.node = None
             return True
+
+        if self.remainingBurnTime > self.tuneTime:
+            self.mode = 'Firing'
+            self.vessel.control.throttle = 1
+        else:
+            self.mode = 'Tuning'
+            self.vessel.control.throttle = max(0.005,
+                                               smoothThrottle(self.vessel, self.remainingBurn()[1], self.tuneTime))
+
+        return False
+
+    def displayValues(self):
+        return [self.prettyName,
+                'Mode : ' + self.mode,
+                'TlBrn: ' + str(round(self.totalBurnTime, 1)),
+                'RmBrn: ' + str(round(self.remainingBurnTime, 1))]
